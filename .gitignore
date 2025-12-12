@@ -1,0 +1,14 @@
+# Python virtual environment
+venv/
+.venv/
+ENV/
+env/
+bin/
+Lib/
+Scripts/
+lib/
+lib64/
+include/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
