@@ -28,6 +28,10 @@ serial_comm = None
 # serial_comm = serial.Serial(PORT, BAUDRATE, timeout=1)
 running = True
 
+csv_file = 'ESP_stream_data.csv'  # Update this to match the subject and trial name
+steps_file = 'Parsed_steps_data.csv'
+vgrf_file = 'Predicted_vGRF_data.csv'
+
 packet_analysis = True
 analysis_window = 1000
 Analysis_DF = pd.DataFrame(columns=['DeviceID', 'PacketID', 'Timestamp'])
@@ -39,9 +43,6 @@ loss_counter = 0
 accel_scale = 2.0 / 32768.0
 gyro_scale = 250.0 / 32768.0
 magneto_scale = 4.0 / 32768.0
-
-
-csv_file = "IMU_data_RevB_v3.csv"
 
 
 def handle_info_packet(packet_bytes):
@@ -121,6 +122,7 @@ def parse_header(data):
 def read_serial():
     global running, serial_comm, ESPData, steps_df, vgrf_df, axes
     while running:
+        # print("READ THREAD: Attempting to read header...")
         # Read just the header
         header_bytes = serial_comm.read(HEADER_SIZE)
         if len(header_bytes) < HEADER_SIZE:
@@ -128,8 +130,15 @@ def read_serial():
 
         try:
             packet_type, payload_len, device_id, timestamp = parse_header(header_bytes)
+            # print(f"DEBUG: Received Packet Type: {hex(packet_type)}")
+
+            # ADDED SYNCHRONIZATION LOGIC HERE OS 12/15/25
+            if packet_type not in [0x01, 0x02]:
+                serial_comm.read(1) # Discard the first byte and shift the window
+                continue
+
             remaining_bytes = serial_comm.read(payload_len + FOOTER_SIZE)
-            # print('reading serial data')
+            
             # Read the payload and footer based on packet_type
             if len(remaining_bytes) == payload_len + FOOTER_SIZE:
                 if packet_type == 0x01:
@@ -200,7 +209,7 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
         print('Start index for analysis: ', start, '   Total Samples: ', len(stream_df))
     if start < 0 or len(stream_df) < est_samp_freq * search_seconds:
         # print("Not enough data for analysis")
-        return stream_df, steps_df, vgrf_df, axes
+        return stream_df, steps_df, vgrf_df, axes 
 
     # dont analyze too often, only F frequency samples
     # when not within tolerance (tol) of frequency intervals, only append data and return
@@ -215,7 +224,7 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
         # print('Processing sensor data at time: ', time)
         pass
     else:
-        return stream_df, steps_df, vgrf_df, axes
+        return stream_df, steps_df, vgrf_df, axes 
 
 
     # process sensor data (parse, resample, and filter)
@@ -277,9 +286,11 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
     # log output in steps df
     new_l_inds = []
     new_r_inds = []
+    print(f"DEBUG: Checking strikes. Left: {len(left_strikes)}, Right: {len(right_strikes)}")
     if len(left_strikes) > 0:
         if left_strikes[-1] not in steps_df['End_Frame'].values:
             if len(left_strikes) > 2:
+                print("DEBUG: LEFT STEP LOGGED!")
                 start_frame = left_strikes[-2]
                 end_frame = left_strikes[-1]
                 side = 'left'
@@ -418,6 +429,10 @@ def main(run):
                     serial_comm = serial.Serial(PORT, BAUDRATE, timeout=1)
                     print(f"Connecting to {PORT} at {BAUDRATE} baud...")
 
+                    # buffer clearing
+                    serial_comm.reset_input_buffer() 
+                    print("Serial buffers reset.")
+
                     w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
                     steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
                     vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
@@ -430,10 +445,11 @@ def main(run):
                     fig.set_figwidth(8)
 
                 else:
-                    print('serial port already connected, continuing...')
+                    print('serial port connected, continuing...')
 
                 reader_thread = threading.Thread(target=read_serial, daemon=True)
                 reader_thread.start()
+                print("MAIN THREAD: Waiting for user input. Type 'exit' to quit...")
 
                 user_input = input("")
                 # if user_input.lower() == 'exit':
@@ -449,7 +465,7 @@ def main(run):
 
             elif run == 'csv':
                 # load data to simulate real-time processing loop
-                fn = 'IMU_data_ricky_walk.csv'
+                fn = 'IMU_data_os_12152025.csv'
                 data = pd.read_csv(fn)
                 print(f'loading csv data from: {fn}')
                 print(data.head())
@@ -514,9 +530,9 @@ def main(run):
             serial_comm.close()
             print("Serial port closed.")
 
-        csv_file = 'ESP_stream_data.csv'
-        steps_file = 'Parsed_steps_data.csv'
-        vgrf_file = 'Predicted_vGRF_data.csv'
+        # csv_file = 'ESP_stream_data.csv' 
+        # steps_file = 'Parsed_steps_data.csv'
+        # vgrf_file = 'Predicted_vGRF_data.csv'
         ESPData.to_csv(csv_file, index=False)
         steps_df.to_csv(steps_file, index=False)
         vgrf_df.to_csv(vgrf_file, index=False)
