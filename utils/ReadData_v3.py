@@ -28,7 +28,7 @@ ooo_counter = 0
 loss_counter = 0
 
 # Based on configuration
-accel_scale = 2.0 / 32768.0
+accel_scale = 8.0 / 32768.0
 gyro_scale = 250.0 / 32768.0
 magneto_scale = 4.0 / 32768.0
 
@@ -38,7 +38,7 @@ ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 'Timesta
                                 'GyroX', 'GyroY', 'GyroZ', 
                                 'MagX', 'MagY', 'MagZ', 
                                 'Flags', 'Battery', 'CRC'])
-# ESPData.to_csv(csv_file, index=False)
+ESPData.to_csv(csv_file, index=False)
 
 
 def calculate_crc8(data):

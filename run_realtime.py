@@ -1,6 +1,6 @@
 import serial
 import struct
-# import time
+import time
 import threading
 import pandas as pd
 import utils.read_packets as RP
@@ -40,7 +40,7 @@ ooo_counter = 0
 loss_counter = 0
 
 # Based on configuration
-accel_scale = 2.0 / 32768.0
+accel_scale = 8.0 / 32768.0
 gyro_scale = 250.0 / 32768.0
 magneto_scale = 4.0 / 32768.0
 
@@ -94,7 +94,7 @@ def handle_data_packet(packet_bytes):
         duplicate = not Analysis_DF[(Analysis_DF['DeviceID'] == data_packet['DeviceID']) & (Analysis_DF['PacketID'] == data_packet['PacketID'])].empty
         if(duplicate):
             duplicate_counter+=1
-            print(f"Duplicate Packet (DeviceID={data_packet['DeviceID']}, PacketID={data_packet['PacketID']}) | Counter = {duplicate_counter}")
+            # print(f"Duplicate Packet (DeviceID={data_packet['DeviceID']}, PacketID={data_packet['PacketID']}) | Counter = {duplicate_counter}")
 
         # # Check for OOO Packets
         # ooo_packets = not Analysis_DF[(Analysis_DF['DeviceID'] == data_packet['DeviceID']) & (data_packet['PacketID'] < Analysis_DF['PacketID'])].empty
@@ -132,7 +132,7 @@ def read_serial():
             packet_type, payload_len, device_id, timestamp = parse_header(header_bytes)
             # print(f"DEBUG: Received Packet Type: {hex(packet_type)}")
 
-            # ADDED SYNCHRONIZATION LOGIC HERE OS 12/15/25
+            # ADDED SYNCHRONIZATION LOGIC HERE (OS 12/15/25)
             if packet_type not in [0x01, 0x02]:
                 serial_comm.read(1) # Discard the first byte and shift the window
                 continue
@@ -142,14 +142,32 @@ def read_serial():
             # Read the payload and footer based on packet_type
             if len(remaining_bytes) == payload_len + FOOTER_SIZE:
                 if packet_type == 0x01:
+                    if payload_len > 64: # Added to prevent reading massive strings OS 12/17/2025
+                        print(f"PROTOCOL ERROR: Info payload too large ({payload_len} bytes). Resyncing.")
+                        serial_comm.reset_input_buffer()
+                        continue
                     handle_info_packet(header_bytes + remaining_bytes)
                 elif packet_type == 0x02:
+                    # Data packets MUST have a payload length of 24 bytes
+                    if payload_len != 24: 
+                        print(f"PROTOCOL ERROR: Data payload size mismatch (Expected 24, Got {payload_len}). Resyncing.")
+                        serial_comm.reset_input_buffer()
+                        continue
                     packet = handle_data_packet(header_bytes + remaining_bytes)
+
+                    if packet is not None: # Added lines OS 12/16/2025
+                        # Success --> process and analyze data 
+                        ESPData, steps_df, vgrf_df, axes = process_packet(packet, ESPData, steps_df, vgrf_df, axes)
+                    else:
+                        serial_comm.reset_input_buffer()
+                        print("STREAM RESYNC: Cleared input buffer after data unpacking error.")
+                        time.sleep(0.001) #Sleep for 1 millisecond (prevents CPU overload)
+
                     # TODO: here is where I expect we need to process packets in real time. These are global 
                     # variables, so they should still be present for exporting at the end. 
-                    ESPData, steps_df, vgrf_df, axes = process_packet(packet, ESPData, steps_df, vgrf_df, axes)
+                    # ESPData, steps_df, vgrf_df, axes = process_packet(packet, ESPData, steps_df, vgrf_df, axes)
                 else:
-                    # Received unknown packetS
+                    # Received unknown packets
                     pass
         
         except struct.error:
@@ -235,6 +253,12 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
     ProcessedSensors = {}
     SensorNames = ['left', 'right', 'waist']
     for s in SensorNames:
+
+        # Added check for data analysis crash OS 12/16/2025
+        if Sensors[s].empty: 
+            print(f"DEBUG: Sensor data for {s} is empty. Skipping analysis for this packet.")
+            return stream_df, steps_df, vgrf_df, axes
+        
         ProcessedSensors[s] = _process_sensor_df(Sensors[s])
     if any(ProcessedSensors[s] is None for s in SensorNames):
         print("Error processing sensor data")
@@ -286,11 +310,10 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
     # log output in steps df
     new_l_inds = []
     new_r_inds = []
-    print(f"DEBUG: Checking strikes. Left: {len(left_strikes)}, Right: {len(right_strikes)}")
+    # print(f"DEBUG: Checking strikes. Left: {len(left_strikes)}, Right: {len(right_strikes)}")
     if len(left_strikes) > 0:
         if left_strikes[-1] not in steps_df['End_Frame'].values:
             if len(left_strikes) > 2:
-                print("DEBUG: LEFT STEP LOGGED!")
                 start_frame = left_strikes[-2]
                 end_frame = left_strikes[-1]
                 side = 'left'
@@ -336,61 +359,128 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
 
 
     # plot results
-    if time > 10 and plot:
+    # if time > 10 and plot:
 
-        ax1 = axes[0]  # Top subplot
-        ax2 = axes[1]  # Middle subplot
-        ax3 = axes[2]  # Bottom subplot
-        A1 = 0.5
-        A2 = 0.3
+    #     ax1 = axes[0]  # Top subplot
+    #     ax2 = axes[1]  # Middle subplot
+    #     ax3 = axes[2]  # Bottom subplot
+    #     A1 = 0.5
+    #     A2 = 0.3
 
-        # realtime plot of input acceleration data
-        ax1.plot(ProcessedSensors['left']['time'], ProcessedSensors['left']['accel_filtered'], 
-                 color='C0', label='Left Accel Filtered', alpha=A1)
-        ax1.plot(ProcessedSensors['right']['time'], ProcessedSensors['right']['accel_filtered'], 
-                 color='C1', label='Right Accel Filtered', alpha=A1)
-        ax1.plot(ProcessedSensors['waist']['time'], ProcessedSensors['waist']['accel_filtered'], 
-                 color='C2', label='Waist Accel Filtered', alpha=A1)
-        for x in left_strike_times:
-            ax1.axvline(x=x, color='C0', linestyle='--', alpha=A1)
-        for x in right_strike_times:
-            ax1.axvline(x=x, color='C1', linestyle='--', alpha=A1)
-        # ax1.legend(fontsize='small')
-        ax1.set_title('Streaming Acceleration Data')
-        ax1.set_ylabel('Accel (g)')
-        ax1.set_xlabel('Time (s)')
+    #     # realtime plot of input acceleration data
+    #     ax1.plot(ProcessedSensors['left']['time'], ProcessedSensors['left']['accel_filtered'], 
+    #              color='C0', label='Left Accel Filtered', alpha=A1)
+    #     ax1.plot(ProcessedSensors['right']['time'], ProcessedSensors['right']['accel_filtered'], 
+    #              color='C1', label='Right Accel Filtered', alpha=A1)
+    #     ax1.plot(ProcessedSensors['waist']['time'], ProcessedSensors['waist']['accel_filtered'], 
+    #              color='C2', label='Waist Accel Filtered', alpha=A1)
+    #     for x in left_strike_times:
+    #         ax1.axvline(x=x, color='C0', linestyle='--', alpha=A1)
+    #     for x in right_strike_times:
+    #         ax1.axvline(x=x, color='C1', linestyle='--', alpha=A1)
+    #     # ax1.legend(fontsize='small')
+    #     ax1.set_title('Streaming Acceleration Data')
+    #     ax1.set_ylabel('Accel (g)')
+    #     ax1.set_xlabel('Time (s)')
 
-        # extracted & parsed waist acceleration to send to model
-        waist_acc_cols = [col for col in steps_df.columns if 'waist_accel' in col]
-        l_waist_acc = steps_df[waist_acc_cols].iloc[new_l_inds]
-        l_waist_acc.columns = range(0, 100)
-        r_waist_acc = steps_df[waist_acc_cols].iloc[new_r_inds]
-        r_waist_acc.columns = range(0, 100)
-        ax2.plot(l_waist_acc.T, color='C0', alpha=A2, lw=2)
-        ax2.plot(r_waist_acc.T, color='C1', alpha=A2, lw=2)
-        ax2.set_title('Step-Parsed Waist Accelerations')
-        ax2.set_ylabel('Accel (g)')
-        ax2.set_xlabel('% Gait Cycle')
+    #     # extracted & parsed waist acceleration to send to model
+    #     waist_acc_cols = [col for col in steps_df.columns if 'waist_accel' in col]
+    #     l_waist_acc = steps_df[waist_acc_cols].iloc[new_l_inds]
+    #     l_waist_acc.columns = range(0, 100)
+    #     r_waist_acc = steps_df[waist_acc_cols].iloc[new_r_inds]
+    #     r_waist_acc.columns = range(0, 100)
+    #     ax2.plot(l_waist_acc.T, color='C0', alpha=A2, lw=2)
+    #     ax2.plot(r_waist_acc.T, color='C1', alpha=A2, lw=2)
+    #     ax2.set_title('Step-Parsed Waist Accelerations')
+    #     ax2.set_ylabel('Accel (g)')
+    #     ax2.set_xlabel('% Gait Cycle')
 
-        # model predicted vGRF
-        vgrf_cols = [col for col in vgrf_df.columns if 'vGRF_' in col]
-        l_vgrf = vgrf_df[vgrf_cols].iloc[new_l_inds]
-        l_vgrf.columns = range(0, 100)
-        r_vgrf = vgrf_df[vgrf_cols].iloc[new_r_inds]
-        r_vgrf.columns = range(0, 100)
-        ax3.plot(l_vgrf.T, color='C0', alpha=A2, lw=2)
-        ax3.plot(r_vgrf.T, color='C1', alpha=A2, lw=2)
-        ax3.set_title('Step-Predicted vGRFs')
-        ax3.set_ylabel('vGRF (BW)')
-        ax3.set_xlabel('% Gait Cycle')
+    #     # model predicted vGRF
+    #     vgrf_cols = [col for col in vgrf_df.columns if 'vGRF_' in col]
+    #     l_vgrf = vgrf_df[vgrf_cols].iloc[new_l_inds]
+    #     l_vgrf.columns = range(0, 100)
+    #     r_vgrf = vgrf_df[vgrf_cols].iloc[new_r_inds]
+    #     r_vgrf.columns = range(0, 100)
+    #     ax3.plot(l_vgrf.T, color='C0', alpha=A2, lw=2)
+    #     ax3.plot(r_vgrf.T, color='C1', alpha=A2, lw=2)
+    #     ax3.set_title('Step-Predicted vGRFs')
+    #     ax3.set_ylabel('vGRF (BW)')
+    #     ax3.set_xlabel('% Gait Cycle')
 
-        plt.show(block=False)
-        plt.tight_layout()
-        plt.savefig('acc_steps_preds.png')
+    #     # plt.show(block=False) # Commented out OS 12/16/2025
+    #     plt.tight_layout()
+    #     plt.savefig('acc_steps_preds.png')
 
         
     return stream_df, steps_df, vgrf_df, axes
 
+def generate_final_plot(ESPData, steps_df, vgrf_df): # Taken out of process_packets for stability OS 12/17/2025
+    """
+    Generates the final summary plot using the original logic from process_packet.
+    """
+
+    # Re-process full dataset to get filtered lines for the top plot
+    Sensors = input_df(ESPData.copy())
+    ProcessedSensors = {}
+    for s in ['left', 'right', 'waist']:
+        ProcessedSensors[s] = _process_sensor_df(Sensors[s])
+
+    # Setup the figure
+    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(8, 10))
+    ax1 = axes[0]  # Top subplot
+    ax2 = axes[1]  # Middle subplot
+    ax3 = axes[2]  # Bottom subplot
+    A1 = 0.5
+    A2 = 0.3
+
+    # Plot 1: acceleration data
+    ax1.plot(ProcessedSensors['left']['time'], ProcessedSensors['left']['accel_filtered'], 
+                color='C0', label='Left Accel Filtered', alpha=A1)
+    ax1.plot(ProcessedSensors['right']['time'], ProcessedSensors['right']['accel_filtered'], 
+                color='C1', label='Right Accel Filtered', alpha=A1)
+    ax1.plot(ProcessedSensors['waist']['time'], ProcessedSensors['waist']['accel_filtered'], 
+                color='C2', label='Waist Accel Filtered', alpha=A1)
+    # Vertical lines for all detected steps
+    left_strike_times = steps_df[steps_df['Side'] == 'left']['Timestamp']
+    right_strike_times = steps_df[steps_df['Side'] == 'right']['Timestamp']
+    for x in left_strike_times:
+        ax1.axvline(x=x, color='C0', linestyle='--', alpha=A1)
+    for x in right_strike_times:
+        ax1.axvline(x=x, color='C1', linestyle='--', alpha=A1)
+    # ax1.legend(fontsize='small')
+    ax1.set_title('Streaming Acceleration Data')
+    ax1.set_ylabel('Accel (g)')
+    ax1.set_xlabel('Time (s)')
+
+    # Plot 2: extracted & parsed waist acceleration to send to model
+    waist_acc_cols = [col for col in steps_df.columns if 'waist_accel' in col]
+    l_waist_acc = steps_df[steps_df['Side'] == 'left'][waist_acc_cols]
+    r_waist_acc = steps_df[steps_df['Side'] == 'right'][waist_acc_cols]
+    l_waist_acc.columns = range(0, 100)
+    r_waist_acc.columns = range(0, 100)
+    ax2.plot(l_waist_acc.T, color='C0', alpha=A2, lw=2)
+    ax2.plot(r_waist_acc.T, color='C1', alpha=A2, lw=2)
+    ax2.set_title('Step-Parsed Waist Accelerations')
+    ax2.set_ylabel('Accel (g)')
+    ax2.set_xlabel('% Gait Cycle')
+
+    # Plot 3: model predicted vGRF
+    vgrf_cols = [col for col in vgrf_df.columns if 'vGRF_' in col]
+    l_vgrf = vgrf_df[vgrf_df['ID'].str.startswith('L')][vgrf_cols]
+    r_vgrf = vgrf_df[vgrf_df['ID'].str.startswith('R')][vgrf_cols]
+    l_vgrf.columns = range(0, 100)
+    r_vgrf.columns = range(0, 100)
+    ax3.plot(l_vgrf.T, color='C0', alpha=A2, lw=2)
+    ax3.plot(r_vgrf.T, color='C1', alpha=A2, lw=2)
+    ax3.set_title('Step-Predicted vGRFs')
+    ax3.set_ylabel('vGRF (BW)')
+    ax3.set_xlabel('% Gait Cycle')
+
+    # plt.show(block=False) # Commented out OS 12/16/2025
+    plt.tight_layout()
+    plt.savefig('acc_steps_preds.png')
+    print("plot saved as 'acc_steps_preds.png'")
+    plt.show()
 
 def main(run):
     """Main function to run real-time data processing from serial port or CSV file.
@@ -400,124 +490,121 @@ def main(run):
             'csv' to read from CSV file and play through the data as if real-time.
     """
     global serial_comm, running, ESPData, steps_df, vgrf_df, axes
+
+    # Initialize dataframes to store results ONCE at the start (moved outside of while True OS 12/17/2025)
+    w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
+    steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
+    vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
+    vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
+    ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
+                                'Timestamp', 'PacketID', 'accel', 
+                                'Flags', 'Battery', 'CRC', 'time'])
+    
+    axes = None
+    
+    # # create figure and subplots for showing data
+    # fig, axes = plt.subplots(nrows=3, ncols=1)
+    # fig.set_figheight(10) 
+    # fig.set_figwidth(8)
+
     try:
-        while True:
+        if run == 'serial':
+            # running in serial mode
+            if serial_comm == None:
+                serial_comm = serial.Serial(PORT, BAUDRATE, timeout=1)
+                print(f"Connecting to {PORT} at {BAUDRATE} baud...")
+                serial_comm.reset_input_buffer() # buffer clearing
+                print("Serial buffers reset.")
 
-            
+            reader_thread = threading.Thread(target=read_serial, daemon=True)
+            reader_thread.start()
+            print("Reader thread started. System ready for commands.")
 
-            # initialize dataframes to store results
-            # w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
-            # steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
-            # vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
-            # vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
-            # ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
-            #                             'Timestamp', 'PacketID', 'accel', 
-            #                             'Flags', 'Battery', 'CRC', 'time'])
-            
-            # create figure and subplots for showing data
-            # fig, axes = plt.subplots(nrows=3, ncols=1)
-            # fig.set_figheight(10) 
-            # fig.set_figwidth(8)
-
-
-            if run == 'serial':
-                # running in serial mode
-                # global serial_comm, running, ESPData, steps_df, vgrf_df
-                
-
-                if serial_comm == None:
-                    serial_comm = serial.Serial(PORT, BAUDRATE, timeout=1)
-                    print(f"Connecting to {PORT} at {BAUDRATE} baud...")
-
-                    # buffer clearing
-                    serial_comm.reset_input_buffer() 
-                    print("Serial buffers reset.")
-
-                    w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
-                    steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
-                    vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
-                    vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
-                    ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
-                                            'Timestamp', 'PacketID', 'accel', 
-                                            'Flags', 'Battery', 'CRC', 'time'])
-                    fig, axes = plt.subplots(nrows=3, ncols=1)
-                    fig.set_figheight(10) 
-                    fig.set_figwidth(8)
-
-                else:
-                    print('serial port connected, continuing...')
-
-                reader_thread = threading.Thread(target=read_serial, daemon=True)
-                reader_thread.start()
-                print("MAIN THREAD: Waiting for user input. Type 'exit' to quit...")
-
-                user_input = input("")
-                # if user_input.lower() == 'exit':
-                #     break
-                # print('right before sending data')
+            while True:
+                user_input = input(">>")
+                if user_input.lower() == 'exit':
+                    running = False
+                    break
                 send_data(user_input)
-                # print('running: ', running)
+                time.sleep(0.1) # small delay to allow command to send
+                # # print('running: ', running)
+
+                # else:
+                #     print('serial port connected, continuing...')
+
+
+                    # w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
+                    # steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
+                    # vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
+                    # vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
+                    # ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
+                    #                         'Timestamp', 'PacketID', 'accel', 
+                    #                         'Flags', 'Battery', 'CRC', 'time'])
+                    # fig, axes = plt.subplots(nrows=3, ncols=1)
+                    # fig.set_figheight(10) 
+                    # fig.set_figwidth(8)
+
 
                 # plt.tight_layout()
                 # plt.show()
                 # fig.savefig('acc_steps_preds.png')
 
 
-            elif run == 'csv':
-                # load data to simulate real-time processing loop
-                fn = 'IMU_data_os_12152025.csv'
-                data = pd.read_csv(fn)
-                print(f'loading csv data from: {fn}')
-                print(data.head())
+        elif run == 'csv':
+            # load data to simulate real-time processing loop
+            fn = 'IMU_data_os_12152025.csv'
+            data = pd.read_csv(fn)
+            print(f'loading csv data from: {fn}')
+            print(data.head())
 
-                w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
-                steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
-                vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
-                vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
+            # w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
+            # steps_df = pd.DataFrame(columns=['Timestamp', 'Side', 'Start_Frame', 'End_Frame', 'ID'] + w_acc_cols) 
+            # vgrf_cols = [f'vGRF_{i}' for i in range(0, 100)]
+            # vgrf_df = pd.DataFrame(columns=['ID','PeakvGRF'] + vgrf_cols)
 
-                ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
-                                        'Timestamp', 'PacketID', 'accel', 
-                                        'Flags', 'Battery', 'CRC', 'time'])
+            # ESPData = pd.DataFrame(columns=['PacketType', 'PayloadLen', 'DeviceID', 
+            #                         'Timestamp', 'PacketID', 'accel', 
+            #                         'Flags', 'Battery', 'CRC', 'time'])
+            
+            # create figure and subplots for showing data
+            # fig, axes = plt.subplots(nrows=3, ncols=1)
+            # fig.set_figheight(10) 
+            # fig.set_figwidth(8)
+
+            # simulate real-time data reception
+            print('\nStarting simulation...')
+            for index, row in data.iterrows():
+                packet = row.to_dict()
+
+                if len(packet) == 0:
+                    continue
+
+                print(index)
+                print('Packet received:   ', packet)
+                ESPData, steps_df, vgrf_df, axes = process_packet(packet, ESPData, steps_df, vgrf_df, axes)
+
+                if index > 14000:
+                    print("\nEnding simulation.")
+                    print('Streaming DF: \n', ESPData.tail())
+                    print('Steps DF: \n', steps_df.tail())
+                    print('vGRF DF: \n', vgrf_df.tail())
+
+                    ax1 = axes[0] 
+                    window = 10
+                    if max(ESPData['time']) > window:
+                        ax1.set_xlim([max(ESPData['time']) - window, max(ESPData['time'])])
+
+                    plt.tight_layout()
+                    plt.show()
+                    fig.savefig('acc_steps_preds.png')
+
+                    print('Ending Simulation early')
+                    break
+
+                # break # exit csv running when all rows ran through
                 
-                # create figure and subplots for showing data
-                fig, axes = plt.subplots(nrows=3, ncols=1)
-                fig.set_figheight(10) 
-                fig.set_figwidth(8)
-
-                # simulate real-time data reception
-                print('\nStarting simulation...')
-                for index, row in data.iterrows():
-                    packet = row.to_dict()
-
-                    if len(packet) == 0:
-                        continue
-
-                    print(index)
-                    print('Packet received:   ', packet)
-                    ESPData, steps_df, vgrf_df, axes = process_packet(packet, ESPData, steps_df, vgrf_df, axes)
-
-                    if index > 14000:
-                        print("\nEnding simulation.")
-                        print('Streaming DF: \n', ESPData.tail())
-                        print('Steps DF: \n', steps_df.tail())
-                        print('vGRF DF: \n', vgrf_df.tail())
-
-                        ax1 = axes[0] 
-                        window = 10
-                        if max(ESPData['time']) > window:
-                            ax1.set_xlim([max(ESPData['time']) - window, max(ESPData['time'])])
-
-                        plt.tight_layout()
-                        plt.show()
-                        fig.savefig('acc_steps_preds.png')
-
-                        print('Ending Simulation early')
-                        break
-
-                break # exit csv running when all rows ran through
-                    
-            else:
-                raise ValueError("Invalid run mode. Use 'serial' or 'csv'.")
+        else:
+            raise ValueError("Invalid run mode. Use 'serial' or 'csv'.")
             
             
     except KeyboardInterrupt:
@@ -530,13 +617,21 @@ def main(run):
             serial_comm.close()
             print("Serial port closed.")
 
-        # csv_file = 'ESP_stream_data.csv' 
+        # csv_file = 'ESP_stream_data.csv' # moved to beginning of script OS 12/16/2025
         # steps_file = 'Parsed_steps_data.csv'
         # vgrf_file = 'Predicted_vGRF_data.csv'
+
+        # Save CSV Data
         ESPData.to_csv(csv_file, index=False)
         steps_df.to_csv(steps_file, index=False)
         vgrf_df.to_csv(vgrf_file, index=False)
         print(f"Data saved to {csv_file} and {steps_file} and {vgrf_file}")
+
+        print("Generating final summary plot...")
+        try:
+            generate_final_plot(ESPData, steps_df, vgrf_df)
+        except Exception as e:
+            print(f"Could not generate plot: {e}")
 
 
 if __name__ == "__main__":
