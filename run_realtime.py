@@ -1,3 +1,4 @@
+import os
 import serial
 import struct
 import time
@@ -27,10 +28,15 @@ serial_lock = threading.Lock()
 serial_comm = None
 # serial_comm = serial.Serial(PORT, BAUDRATE, timeout=1)
 running = True
+imu_packets = []
 
-csv_file = 'ESP_stream_data.csv'  # Update this to match the subject and trial name
-steps_file = 'Parsed_steps_data.csv'
-vgrf_file = 'Predicted_vGRF_data.csv'
+csv_filename = 'ESP_stream_data.csv'  # Update this to match the subject and trial name
+steps_filename = 'Parsed_steps_data.csv'
+vgrf_filename = 'Predicted_vGRF_data.csv'
+plot_filename = 'acc_steps_vgrfs.png'
+csv_file = csv_filename
+steps_file = steps_filename
+vgrf_file = vgrf_filename
 
 packet_analysis = True
 analysis_window = 1000
@@ -58,7 +64,7 @@ def handle_info_packet(packet_bytes):
     print(f"Info Packet=>Time:{info_packet['Timestamp']}, Info:{info_packet['Info']}")
 
 def handle_data_packet(packet_bytes):
-    global Analysis_DF, duplicate_counter, ooo_counter, loss_counter
+    global Analysis_DF, duplicate_counter, ooo_counter, loss_counter, imu_packets
     # Parse the data
     data_packet = RP.parse_data_packet(packet_bytes)    
 
@@ -86,8 +92,9 @@ def handle_data_packet(packet_bytes):
     data_packet['MagZ'] =  data_packet['MagZ'] * magneto_scale
 
     # Store the packet
+    imu_packets.append(data_packet.copy())
     newdata = pd.DataFrame([data_packet])
-    newdata.to_csv(csv_file, mode='a', index=False, header=False)
+    # newdata.to_csv(csv_file, mode='a', index=False, header=False)
 
     if(packet_analysis):
         # Check for Duplicate packet
@@ -414,7 +421,7 @@ def process_packet(packet, stream_df, steps_df, vgrf_df, axes, verbose=False, pl
         
     return stream_df, steps_df, vgrf_df, axes
 
-def generate_final_plot(ESPData, steps_df, vgrf_df): # Taken out of process_packets for stability OS 12/17/2025
+def generate_final_plot(ESPData, steps_df, vgrf_df, folder_path): # Taken out of process_packets for stability OS 12/17/2025
     """
     Generates the final summary plot using the original logic from process_packet.
     """
@@ -476,10 +483,10 @@ def generate_final_plot(ESPData, steps_df, vgrf_df): # Taken out of process_pack
     ax3.set_ylabel('vGRF (BW)')
     ax3.set_xlabel('% Gait Cycle')
 
-    # plt.show(block=False) # Commented out OS 12/16/2025
     plt.tight_layout()
-    plt.savefig('acc_steps_preds.png')
-    print("plot saved as 'acc_steps_preds.png'")
+    save_path = os.path.join(folder_path, plot_filename)
+    plt.savefig(save_path)
+    print(f"plot saved as '{save_path}'")
     plt.show()
 
 def main(run):
@@ -490,6 +497,26 @@ def main(run):
             'csv' to read from CSV file and play through the data as if real-time.
     """
     global serial_comm, running, ESPData, steps_df, vgrf_df, axes
+    global csv_file, steps_file, vgrf_file, imu_packets
+
+    # 1. Prompt for Folder Name (generalized)
+    input_num = input("What would you like to name this session? ")
+    folder_name = f"{input_num}"
+
+    # 1. Prompt for NCBC Study
+    # sub_num = input("Enter Subject #: ")
+    # trial_num = input("Enter Trial #: ")
+    # folder_name = f"ncbc_s{sub_num}_{trial_num}"
+
+    # 2. Create the folder if it doesn't exist
+    if not os.path.exists(folder_name):
+        os.makedirs(folder_name)
+        print(f"Created folder: {folder_name}")
+
+    # 3. Update file paths to be inside that folder
+    csv_file = os.path.join(folder_name, csv_filename)
+    steps_file = os.path.join(folder_name, steps_filename)
+    vgrf_file = os.path.join(folder_name, vgrf_filename)
 
     # Initialize dataframes to store results ONCE at the start (moved outside of while True OS 12/17/2025)
     w_acc_cols = [f'waist_accel_{i}' for i in range(0, 100)]
@@ -518,7 +545,7 @@ def main(run):
 
             reader_thread = threading.Thread(target=read_serial, daemon=True)
             reader_thread.start()
-            print("Reader thread started. System ready for commands.")
+            print("Reader thread started. System ready for commands. Enter 'exit' to end session.")
 
             while True:
                 user_input = input(">>")
@@ -552,7 +579,12 @@ def main(run):
 
         elif run == 'csv':
             # load data to simulate real-time processing loop
-            fn = 'IMU_data_os_12152025.csv'
+            # fn = 'IMU_data_RevB_v3_09112025_Walk1.csv'
+            fn = input("Enter the input CSV filename (e.g., my_data.csv): ")
+            if not os.path.exists(fn):
+                print(f"Error: The file '{fn}' was not found.")
+                return 
+            
             data = pd.read_csv(fn)
             print(f'loading csv data from: {fn}')
             print(data.head())
@@ -627,12 +659,27 @@ def main(run):
         vgrf_df.to_csv(vgrf_file, index=False)
         print(f"Data saved to {csv_file} and {steps_file} and {vgrf_file}")
 
+        # Save IMU file    
+        if imu_packets:
+            print("Saving expanded IMU data...")
+            imu_df = pd.DataFrame(imu_packets)
+            target_cols = ['PacketType', 'PayloadLen', 'DeviceID', 'Timestamp', 'PacketID', 
+                           'AccelX', 'AccelY', 'AccelZ', 'GyroX', 'GyroY', 'GyroZ', 
+                           'MagX', 'MagY', 'MagZ', 'Flags', 'Battery', 'CRC']
+            imu_df = imu_df[[c for c in target_cols if c in imu_df.columns]]
+
+            # Save to the folder
+            imu_path = os.path.join(folder_name, 'IMU_data_RevB_v3.csv')
+            imu_df.to_csv(imu_path, index=False)
+            print(f"Expanded IMU data saved to {imu_path}")
+
         print("Generating final summary plot...")
         try:
-            generate_final_plot(ESPData, steps_df, vgrf_df)
+            generate_final_plot(ESPData, steps_df, vgrf_df, folder_name)
         except Exception as e:
             print(f"Could not generate plot: {e}")
 
+        
 
 if __name__ == "__main__":
     main(run='serial') # change to serial to run with sensors connected to the serial port
